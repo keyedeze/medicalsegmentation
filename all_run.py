@@ -138,9 +138,16 @@ def separate_epi_endo(mask_eroded, roi_lv_dilated, dilate_lv_extra=1):
 def solve_laplace(myocardium, endo, epi, max_iter=5000, tol=1e-5):
 
     coords = np.where(myocardium)
-    z1,z2 = coords[0].min()-1, coords[0].max()+2
-    y1,y2 = coords[1].min()-1, coords[1].max()+2
-    x1,x2 = coords[2].min()-1, coords[2].max()+2
+    z1 = max(0, coords[0].min() - 1)
+    z2 = min(myocardium.shape[0], coords[0].max() + 2)
+    
+    y1 = max(0, coords[1].min() - 1)
+    y2 = min(myocardium.shape[1], coords[1].max() + 2)
+    
+    x1 = max(0, coords[2].min() - 1)
+    x2 = min(myocardium.shape[2], coords[2].max() + 2)
+
+    print(f"Myo coords: x1y1z1: {x1},{y1},{z1} / x2y2z2: {x2},{y2},{z2}")
 
     myo = myocardium[z1:z2, y1:y2, x1:x2]
     en  = endo[z1:z2, y1:y2, x1:x2]
@@ -269,7 +276,7 @@ def post_segmentation_processing(input_file, output_file, segmentation_mask = 1,
         r_vox_y = int(round(r_mm / spacing[1]))
         r_vox = max(1, int(round((r_vox_x + r_vox_y) / 2)))
 
-        print(f"r_mm: {r_mm}, spacing: {spacing}, r_vox_x: {r_vox_x}, r_vox_y: {r_vox_y}")
+        print(f"roi_shape: {roi.shape} r_mm: {r_mm}, spacing: {spacing}, r_vox_x: {r_vox_x}, r_vox_y: {r_vox_y}")
         print(f"erosion radius in voxels: {r_vox}")
         print(f"spacing: {spacing}")
         print(f"erosion radius in mm / repeat: {r_mm} / {repeat_alg}")
@@ -390,8 +397,8 @@ def post_segmentation_processing(input_file, output_file, segmentation_mask = 1,
         roi_lv_dilated = binary_dilation(roi_lv, iterations=dilate_voxel)
 
         endo, epi = separate_epi_endo(mask_eroded, roi_lv_dilated, dilate_lv_extra=1)
-        print("endo_seed:", endo.sum(), "epi_seed:", epi.sum())
-        bc_labels = build_bc_label_volume(mask_eroded, endo, epi)
+        print("mask shape:", mask_eroded.shape, "endo_seed:", endo.sum(), "epi_seed:", epi.sum())
+        #bc_labels = build_bc_label_volume(mask_eroded, endo, epi)
 
         phi = solve_laplace(mask_eroded, endo, epi, max_iter=1500, tol=1e-4)
         thickness_map = get_layers(phi, mask_eroded, n_layers=n_theta)
@@ -411,7 +418,13 @@ if __name__ == "__main__":
     print(f"All patient list: {all_patients}")
     output_save_path = r"/mnt/research/research/Data/MyocardialScarDefns_kycn/outs"
     base_root_dir = r"/mnt/research/research/Data/MyocardialScarDefns_kycn/Data"
-    if_folder_exist_overwrite = 0
+
+    all_patients = ["p_040"]
+    print(f"All patient list: {all_patients}")
+    output_save_path = r"/mnt/research/research/Data/MyocardialScarDefns_kycn/outs"
+    base_root_dir = r"/mnt/research/research/Data/MyocardialScarDefns_kycn/have_problems"
+
+    if_folder_exist_overwrite = 1
 
     for p in all_patients:
 
@@ -424,6 +437,7 @@ if __name__ == "__main__":
             if if_folder_exist_overwrite:
                 outputs_file_path = os.path.join(output_save_path, p) + "/"
             else:
+                print(f"Path and files exist, it will not work again! {os.path.join(output_save_path, p)}")
                 continue
         else:
             os.makedirs(full_path, exist_ok=True)
