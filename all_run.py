@@ -4,18 +4,16 @@ if __name__ == "__main__":
 
     args["data_dir"] = r"/mnt/research/research/Data/MyocardialScarDefns_kycn/Data"         # Main data directory
     args["output_dir"] = r"/mnt/research/research/Data/MyocardialScarDefns_kycn/outs"       # output files save directory
-    args["patient_folder_name"] = ["p_140"]                                                 # if you want to work in some spesific files, fill the names
-    args["patient_folder_overwrite"] = 1                                                    # 1 means -> if the same output folder name in the output path, pass that file
+    args["patient_folder_name"] = []                                                 # if you want to work for some spesific folders, fill with the names, otherwise set empty
+    args["patient_folder_overwrite"] = 1                                                    # 0 means -> if the same output folder name in the output path, do not process it, pass the patient
     args["total_seg_model"] = "heartchambers_highres"                                       # Total segmentator model name
     args["segmentation_mask_onoff"] = 1                                                     # segmentation_mask -> open/close choosing myocardium segmentation filter for multiclass segmentation files
-    args["segmentation_mask_min"] = 0                                                       # for multiclass segmentation files
-    args["segmentation_mask_max"] = 2                                                       # for multiclass segmentation files
     args["erosion_onoff"] = 1                                                               # use/ do not use erosion
     args["erosion_disk_r_mm"] = 0.5                                                         # erosion disk radius
     args["erosion_run_n_times"] = 2                                                         # use erosion that times
     args["clustering_type"] = 3                                                             # 1 - cylindirical in 2 axis, 2 - kmeans, 3 - use equipotential surfaces in SAX thickness and use cylindirical in 4CH, else do not use clustering
-    args["segment_seed_number"] = 54                                                        # total number of segments used for clustering
-    args["segment_nz_number"] = 18                                                          # n_z -> number of slices in z direction for clustering = 1, total number of slices in 4CH cylindirical direction for clustering = 3
+    args["segment_seed_number"] = 432                                                       # total number of segments used for clustering
+    args["segment_nz_number"] = 144                                                         # n_z -> number of slices in z direction for clustering = 1, total number of slices in 4CH cylindirical direction for clustering = 3
     args["k_means_3d"] = 1                                                                  # k_means_3d -> 1 - use 3D kmeans algorithm, 0 - use 2D
     args["laplace_max_iter"] = 5000                                                         # laplace solver max iteration
     args["laplace_tolerance"] = 1e-5                                                        # laplace solver tolerance
@@ -103,7 +101,8 @@ if __name__ == "__main__":
         print(f"Image origin: {image.GetOrigin()}")
         print(f"Image direction: {image.GetDirection()}")
 
-        # For transform dcm to nifti, we can use sitk.GetArrayFromImage to get the 3D array and then save it as nifti using sitk.WriteImage. However, if we want to crop the image in z dimension, we can directly use sitk.RegionOfInterest to crop the image and then save it as nifti.
+        # For transform dcm to nifti, we can use sitk.GetArrayFromImage to get the 3D array and then save it as nifti using sitk.WriteImage. 
+        # However, if we want to crop the image in z dimension, we can directly use sitk.RegionOfInterest to crop the image and then save it as nifti.
         #
         # 
 
@@ -145,8 +144,6 @@ if __name__ == "__main__":
         out_arr, erosion_out, spacing, origin, direction, image, roi = post_segmentation_processing(input_file, 
                                                                                                     output_file, 
                                                                                                     segmentation_mask = args["segmentation_mask_onoff"], 
-                                                                                                    segmentation_mask_min = args["segmentation_mask_min"],
-                                                                                                    segmentation_mask_max = args["segmentation_mask_max"],
                                                                                                     erosion_on = args["erosion_onoff"], 
                                                                                                     r_mm = args["erosion_disk_r_mm"], 
                                                                                                     repeat_alg = args["erosion_run_n_times"], 
@@ -158,19 +155,25 @@ if __name__ == "__main__":
                                                                                                     laplace_tolerance = args["laplace_tolerance"])
 
         # Calculate and print voxel sizes for each of the segmentation label
-        voxel_labels = out_arr
-        print(f"Unique Voxel Labels: {np.unique(voxel_labels)}")
-        seed_index = np.unique(voxel_labels)
-        mask_list = [np.sum(voxel_labels == i) for i in seed_index]
-        print(f"Unique Voxel Label Sizes: {mask_list}")
-        
-        #plt.figure(figsize=(10,5))
-        #plt.bar(seed_index[1:], mask_list[1:])  # Skip the 0 label (background)
+        counts = np.bincount(out_arr.ravel())
+
+        for label, count in enumerate(counts):
+            if label == 0:
+                continue
+            print(f"Label {label}: {count}")
+
+        empty_labels = np.where(counts == 0)[0]
+        print("Empty labels:", empty_labels)
+
+        #plt.bar(range(1, len(counts)), counts[1:])
         #plt.xlabel("Cluster Label")
         #plt.ylabel("Voxel Count")
         #plt.title("Voxel Count per Cluster")
         #plt.show()
-        #mask_list
+        voxel_labels = out_arr
+        print(f"Unique Voxel Labels: {np.unique(voxel_labels)}")
+        seed_index = np.unique(voxel_labels)
+        mask_list = [np.sum(voxel_labels == i) for i in seed_index]
 
         # --- write output ---
         out_sitk = sitk.GetImageFromArray(out_arr)   # array (z,y,x)
@@ -210,9 +213,6 @@ if __name__ == "__main__":
 
         # Print voxel counts, percentiles
         print(f'image.shape: {image.shape}')
-        #plt.plot(intens)
-        #plt.show
-
         print(f'One point HU check Array {array[array.shape[0]//2, array.shape[1]//2, 0]}')
         print(f'One point HU check CT {image[image.shape[0]//2, image.shape[1]//2,0]}')
 
@@ -278,6 +278,9 @@ if __name__ == "__main__":
                     f"min: {s['min']:.4f}, "
                     f"max: {s['max']:.4f}\n"
                 )
+            f.write(f"Empty Segments: {empty_labels}")
         with open(outputs_file_path + "/" + "voxel_sizes.txt", "w") as f:
             for i, item in enumerate(mask_list):
-                f.write(f"Voxel Size of Segment {i}: {item}\n")
+                f.write(f"Voxel Size of Segment {seed_index[i]}: {item}\n")
+
+            

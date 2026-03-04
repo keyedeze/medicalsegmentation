@@ -12,15 +12,12 @@ from skimage.morphology import binary_erosion, disk
 import numpy as np
 import SimpleITK as sitk
 from sklearn.cluster import KMeans
-from scipy.ndimage import binary_dilation
+from scipy.ndimage import binary_dilation, distance_transform_edt
 import warnings
-
 
 args = {}
 
-# --- utils for visualization ---
-#
-#
+###### Visualization 
 def resample_to_ref(moving, ref, is_label=True):
     interp = sitk.sitkNearestNeighbor if is_label else sitk.sitkLinear
     return sitk.Resample(
@@ -109,6 +106,7 @@ def show_label_overlay(img_path, seg_path, z=None, alpha=0.45):
     plt.axis("off")
     plt.show()
 
+###### Dicom file listing
 def list_dicom_files(root_dir):
     dicoms = []
     for dp, _, fns in os.walk(root_dir):
@@ -118,6 +116,7 @@ def list_dicom_files(root_dir):
             dicoms.append(p)
     return dicoms, data_file_path
 
+###### For laplace solver
 def separate_epi_endo(mask_eroded, roi_lv_dilated, dilate_lv_extra=1):
     lv = roi_lv_dilated.copy()
     if dilate_lv_extra > 0:
@@ -298,8 +297,8 @@ def build_bc_label_volume(mask_eroded, endo_bc, epi_bc, dtype=np.uint8):
 def get_angular_sectors(myocardium, roi_lv, n_sectors=18, plane='axial'):
     """
     plane: 'axial' (Y-X, short-axis, 4CH view)
-           'sagittal' (Z-Y, yan görünüm)
-           'coronal' (Z-X, ön görünüm)
+           'sagittal' (Z-Y)
+           'coronal' (Z-X)
     """
     coords = np.where(roi_lv)
     
@@ -331,6 +330,16 @@ def get_angular_sectors(myocardium, roi_lv, n_sectors=18, plane='axial'):
     
     return sector_map
 
+def combine_sector_layer_fast(sector_map, layer_map, mask, n_layers):
+    out = np.zeros_like(sector_map, dtype=np.uint16)
+    s = sector_map[mask].astype(np.int32)
+    l = layer_map[mask].astype(np.int32)
+    valid = (s > 0) & (l > 0)
+    out_flat = out.reshape(-1)
+    idx = np.flatnonzero(mask)[valid]
+    out_flat[idx] = ((s[valid]-1) * n_layers + l[valid]).astype(np.uint16)
+    return out
+
 def combine_sector_layer(sector_map, layer_map, n_sectors, n_layers):
     combined = np.zeros(sector_map.shape, dtype=np.int16)
     for s in range(1, n_sectors+1):
@@ -338,8 +347,7 @@ def combine_sector_layer(sector_map, layer_map, n_sectors, n_layers):
             combined[(sector_map == s) & (layer_map == l)] = (s-1)*n_layers + l
     return combined
 
-def post_segmentation_processing(image_file, segmentation_file, segmentation_mask = 1, 
-                                 segmentation_mask_min = 0, segmentation_mask_max = 2, 
+def post_segmentation_processing(image_file, segmentation_file, segmentation_mask = 1,  
                                  erosion_on=1, r_mm=0.5, repeat_alg=2, clustering=3, seed_k=54, k_means_3d=1, n_z=18, laplace_max_iter = 5000, laplace_tolerance = 1e-5):
     """
     outs:
@@ -367,7 +375,7 @@ def post_segmentation_processing(image_file, segmentation_file, segmentation_mas
 
     # --- ROI mask (bool) ---
     if segmentation_mask:
-        roi = (seg > segmentation_mask_min) & (seg < segmentation_mask_max)
+        roi = (seg > 0) & (seg < 2)
     else:
         roi = (seg > 0)
 
@@ -458,7 +466,7 @@ def post_segmentation_processing(image_file, segmentation_file, segmentation_mas
 
             # normalize
             coords = (coords - coords.mean(0, keepdims=True)) / (coords.std(0, keepdims=True) + 1e-8)
-            #intens = (intens - intens.mean(0, keepdims=True)) / (intens.std(0, keepdims=True) + 1e-8)
+            intens = (intens - intens.mean(0, keepdims=True)) / (intens.std(0, keepdims=True) + 1e-8)
 
             # combine features
             X = np.hstack([coords])
@@ -503,12 +511,65 @@ def post_segmentation_processing(image_file, segmentation_file, segmentation_mas
         print("mask shape:", mask_eroded.shape, "endo_seed:", endo.sum(), "epi_seed:", epi.sum())
         #bc_labels = build_bc_label_volume(mask_eroded, endo, epi)
 
+        coords_all = np.argwhere(mask_eroded).astype(np.float32)
+        # take center on LV/mask
+        c = np.argwhere(mask_eroded).mean(axis=0)   # (z,y,x)
+        #cy, cx = c[1], c[2]
+
+        # 1) KMeans on surface (epi/endo)
+        surface = epi  # veya endo
+        coords_s = np.argwhere(surface).astype(np.float32)
+
+        mu = coords_s.mean(axis=0, keepdims=True)
+        sig = coords_s.std(axis=0, keepdims=True) + 1e-8
+        coords_s_n = (coords_s - mu) / sig
+
+        kmeans = KMeans(n_clusters=n_z, n_init="auto", random_state=0).fit(coords_s_n)
+        labels_s = kmeans.labels_  # sadece surface için
+
+        sector0 = np.zeros(mask_eroded.shape, dtype=np.uint16)
+        sector0[surface] = labels_s.astype(np.uint16) + 1
+        counts = np.bincount(labels_s, minlength=n_z)
+
+        print("KMeans clusters:", n_z)
+        print("Cluster size min:", counts.min())
+        print("Cluster size mean:", counts.mean())
+        print("Cluster size max:", counts.max())
+        print("Empty clusters:", np.sum(counts == 0))
+
+        # 4) Propagate surface labels to entire mask using nearest-surface voxel
+        # distance_transform_edt: calculate distance from 0 places -> surface==True points are 0
+        _, inds = distance_transform_edt(~surface, return_indices=True)
+        iz, iy, ix = inds
+
+        sector_map_3d = np.zeros_like(sector0)
+        sector_map_3d[mask_eroded] = sector0[iz, iy, ix][mask_eroded] 
+
+        u = np.unique(sector_map_3d[mask_eroded])
+        print("Unique sectors in volume:", len(u), "min/max:", u.min(), u.max())
+        print("Any zero inside mask?:", np.any(sector_map_3d[mask_eroded] == 0))
+        
         phi = solve_laplace_torch(mask_eroded, endo, epi, max_iter=laplace_max_iter, tol=laplace_tolerance)
+
         thickness_map = get_layers(phi, mask_eroded, n_layers=n_theta)
+        print(f"Laplacian thickness sector map sector size: {n_theta}")
+        u, c = np.unique(thickness_map[mask_eroded], return_counts=True)
 
-        sector_map = get_angular_sectors(mask_eroded, endo, n_sectors=n_z, plane='axial')
+        print("Thickness layers:", u)
+        print("Layer voxel counts:", dict(zip(u, c)))
 
-        out_arr = combine_sector_layer(sector_map, thickness_map, n_sectors=n_z, n_layers=n_theta) # n_layers for thickness SAX, n_sectors for angular 4CH. overall k = n_z * n_theta
+        #sector_map = get_angular_sectors(mask_eroded, endo, n_sectors=n_z, plane='axial')
+
+        out_arr = combine_sector_layer_fast(sector_map_3d, thickness_map, mask_eroded, n_layers=n_theta) # n_layers for thickness SAX, n_sectors for angular 4CH. overall k = n_z * n_theta
+
+        u_sector, c_sector = np.unique(out_arr, return_counts=True)
+        print("Sector count:", len(u_sector))
+        print("Sector min id:", u_sector.min(), "max id:", u_sector.max())
+        print("Sector voxel min:", c_sector.min())
+        print("Sector voxel mean:", c_sector.mean())
+        print("Sector voxel max:", c_sector.max())
+        print(f"Total sector size: {len(np.unique(out_arr))-1}")
+
     else:
         out_arr = mask_eroded.astype(np.uint16)
 
