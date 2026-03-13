@@ -14,6 +14,8 @@ import SimpleITK as sitk
 from sklearn.cluster import KMeans
 from scipy.ndimage import binary_dilation, distance_transform_edt
 import warnings
+import json
+from sklearn.decomposition import PCA
 
 args = {}
 
@@ -274,14 +276,32 @@ def solve_laplace(myocardium, endo, epi, max_iter=5000, tol=1e-5):
     phi_full[z1:z2, y1:y2, x1:x2] = phi
     return phi_full
 
-def get_layers(phi, myocardium, n_layers=6):
-    boundaries = np.linspace(0.0, 1.0, n_layers + 1)
-    layer_map  = np.zeros(phi.shape, dtype=np.int16)
-    for i in range(n_layers):
-        lo, hi = boundaries[i], boundaries[i+1]
-        mask = myocardium & (phi >= lo) & (phi < hi if i < n_layers-1 else phi <= hi)
-        layer_map[mask] = i + 1
+def get_layers(phi, myocardium, n_layers=6, mode="uniform", center=0.5, width=0.1):
+    layer_map = np.zeros(phi.shape, dtype=np.int16)
+
+    if mode == "uniform":
+        boundaries = np.linspace(0.0, 1.0, n_layers + 1)
+        for i in range(n_layers):
+            lo, hi = boundaries[i], boundaries[i+1]
+            mask = myocardium & (phi >= lo) & (phi < hi if i < n_layers-1 else phi <= hi)
+            layer_map[mask] = i + 1
+
+    elif mode == "band":
+        lo = max(0.0, center - width / 2.0)
+        hi = min(1.0, center + width / 2.0)
+        mask = myocardium & (phi >= lo) & (phi <= hi)
+        layer_map[mask] = 1
+
     return layer_map
+
+def get_transmural_band_label(phi, myocardium, center=0.5, width=0.15, label=1):
+    lo = max(0.0, center - width / 2.0)
+    hi = min(1.0, center + width / 2.0)
+
+    out = np.zeros(phi.shape, dtype=np.uint8)
+    mask = myocardium & (phi >= lo) & (phi <= hi)
+    out[mask] = label
+    return out
 
 def build_bc_label_volume(mask_eroded, endo_bc, epi_bc, dtype=np.uint8):
     mask_eroded = mask_eroded.astype(bool)
@@ -517,7 +537,7 @@ def post_segmentation_processing(image_file, segmentation_file, segmentation_mas
         #cy, cx = c[1], c[2]
 
         # 1) KMeans on surface (epi/endo)
-        surface = epi  # veya endo
+        surface = epi  # or endo
         coords_s = np.argwhere(surface).astype(np.float32)
 
         mu = coords_s.mean(axis=0, keepdims=True)
@@ -525,7 +545,7 @@ def post_segmentation_processing(image_file, segmentation_file, segmentation_mas
         coords_s_n = (coords_s - mu) / sig
 
         kmeans = KMeans(n_clusters=n_z, n_init="auto", random_state=0).fit(coords_s_n)
-        labels_s = kmeans.labels_  # sadece surface için
+        labels_s = kmeans.labels_  # only for surface
 
         sector0 = np.zeros(mask_eroded.shape, dtype=np.uint16)
         sector0[surface] = labels_s.astype(np.uint16) + 1
@@ -574,3 +594,690 @@ def post_segmentation_processing(image_file, segmentation_file, segmentation_mas
         out_arr = mask_eroded.astype(np.uint16)
 
     return out_arr, erosion_out, spacing, origin, direction, ct, roi
+
+def read_write_nifti(
+    write_mode,
+    path,
+    file_name,
+    array_for_writing=None,
+    reference_img=None,
+    output_orientation="RAS"
+):
+    full_path = os.path.join(path, file_name)
+
+    if write_mode:
+
+        if array_for_writing is None:
+            raise ValueError("array_for_writing needs for writing operation!!")
+
+        orienter = sitk.DICOMOrientImageFilter()
+        orienter.SetDesiredCoordinateOrientation(output_orientation)
+
+        out_sitk = sitk.GetImageFromArray(array_for_writing)
+
+        if reference_img is not None:
+            out_sitk.CopyInformation(reference_img)
+
+        out_sitk = orienter.Execute(out_sitk)
+
+        sitk.WriteImage(out_sitk, full_path)
+
+        print("Saved:", full_path)
+        print(f"Size: {out_sitk.GetSize()}")
+        print(f"Spacing: {out_sitk.GetSpacing()}")
+        print(f"Origin: {out_sitk.GetOrigin()}")
+        print(f"Direction: {out_sitk.GetDirection()}")
+
+        return out_sitk
+
+    else:
+
+        orienter = sitk.DICOMOrientImageFilter()
+        orienter.SetDesiredCoordinateOrientation(output_orientation)
+
+        img = sitk.ReadImage(full_path)
+        img_oriented = orienter.Execute(img)
+
+        print("Loaded:", full_path)
+        print(f"Size: {img_oriented.GetSize()}")
+        print(f"Spacing: {img_oriented.GetSpacing()}")
+        print(f"Origin: {img_oriented.GetOrigin()}")
+        print(f"Direction: {img_oriented.GetDirection()}")
+
+        return img_oriented
+
+def make_erosion(roi, spacing, r_mm, repeat_alg):
+    """
+    roi     : NumPy array, shape = (z, y, x)
+    spacing : tuple/list, (sx, sy, sz) veya SimpleITK'den gelen spacing
+    r_mm    : erosion yarıçapı (mm)
+    repeat_alg : erosion tekrar sayısı
+    """
+
+    sx, sy = spacing[0], spacing[1]
+
+    r_vox_x = int(round(r_mm / sx))
+    r_vox_y = int(round(r_mm / sy))
+    r_vox = max(1, int(round((r_vox_x + r_vox_y) / 2)))
+
+    print(f"roi_shape: {roi.shape}")
+    print(f"r_mm: {r_mm}")
+    print(f"spacing: {spacing}")
+    print(f"r_vox_x: {r_vox_x}, r_vox_y: {r_vox_y}")
+    print(f"erosion radius in voxels: {r_vox}")
+    print(f"erosion radius in mm / repeat: {r_mm} / {repeat_alg}")
+
+    footprint_disk = disk(r_vox)
+    mask_eroded = np.zeros_like(roi, dtype=bool)
+
+    for z in range(roi.shape[0]):
+        temp_field = roi[z].astype(bool)
+
+        for _ in range(repeat_alg):
+            temp_field = binary_erosion(temp_field, footprint=footprint_disk)
+
+        mask_eroded[z] = temp_field
+    roi_eroded = roi * mask_eroded
+    print(f"Erosion finished")
+    return roi_eroded, r_vox
+
+def hu_heatmap_export(
+volume_path,
+seg_path,
+output_scalar_path,
+output_rgb_path,
+n_levels=10,
+seg_labels=None,
+colormap="turbo",
+outside_value_scalar=-9999.0,
+outside_value_rgb=(0, 0, 0),
+):
+    """
+    Produces:
+        1) Scalar heatmap NIfTI  (float32)
+        2) RGB heatmap NIfTI     (uint8, vector image)
+        3) JSON scale file       (HU range, levels, colormap)
+
+    Parameters
+    ----------
+    volume_path : str
+        Input HU volume (.nii or .nii.gz)
+    seg_path : str
+        Input segmentation (.nii or .nii.gz)
+    output_scalar_path : str
+        Output scalar heatmap NIfTI path
+    output_rgb_path : str
+        Output RGB heatmap NIfTI path
+    n_levels : int
+        Number of quantization levels
+    seg_labels : list or None
+        If None -> seg > 0 used
+        else -> only listed labels used
+    colormap : str
+        matplotlib colormap name: turbo, viridis, plasma, inferno, magma, jet...
+    outside_value_scalar : float
+        Value outside ROI in scalar heatmap
+    outside_value_rgb : tuple
+        RGB color outside ROI
+    """
+
+    # -----------------------------
+    # 1) Load + canonicalize to RAS
+    # -----------------------------
+    orienter = sitk.DICOMOrientImageFilter()
+    orienter.SetDesiredCoordinateOrientation("RAS")
+
+    vol_img = sitk.ReadImage(volume_path)
+    seg_img = sitk.ReadImage(seg_path)
+
+    vol_img = orienter.Execute(vol_img)
+    seg_img = orienter.Execute(seg_img)
+
+    vol = sitk.GetArrayFromImage(vol_img).astype(np.float32)   # (z,y,x)
+    seg = sitk.GetArrayFromImage(seg_img)
+
+    if vol.shape != seg.shape:
+        raise ValueError(f"Volume and segmentation not matched: {vol.shape} vs {seg.shape}")
+
+    # -----------------------------
+    # 2) Build mask
+    # -----------------------------
+    if seg_labels is None:
+        mask = seg > 0
+    else:
+        mask = np.isin(seg, seg_labels)
+
+    if not np.any(mask):
+        raise ValueError("Mask empty")
+
+    # -----------------------------
+    # 3) HU range in ROI
+    # -----------------------------
+    hu_vals = vol[mask]
+    hu_min = float(hu_vals.min())
+    hu_max = float(hu_vals.max())
+
+    print("Segment HU min:", hu_min)
+    print("Segment HU max:", hu_max)
+
+    # -----------------------------
+    # 4) Quantized scalar heatmap
+    # -----------------------------
+    scalar_heatmap = np.full_like(vol, outside_value_scalar, dtype=np.float32)
+
+    if hu_max == hu_min:
+        levels = np.array([hu_min], dtype=np.float32)
+        scalar_heatmap[mask] = hu_min
+    else:
+        levels = np.linspace(hu_min, hu_max, n_levels, dtype=np.float32)
+        idx = np.abs(vol[mask][..., None] - levels).argmin(axis=-1)
+        scalar_heatmap[mask] = levels[idx]
+
+    # -----------------------------
+    # 5) RGB heatmap from scalar
+    # -----------------------------
+    rgb = np.zeros((*scalar_heatmap.shape, 3), dtype=np.uint8)
+
+    if hu_max == hu_min:
+        norm = np.zeros_like(scalar_heatmap, dtype=np.float32)
+        norm[mask] = 1.0
+    else:
+        norm = np.zeros_like(scalar_heatmap, dtype=np.float32)
+        norm[mask] = (scalar_heatmap[mask] - hu_min) / (hu_max - hu_min)
+        norm = np.clip(norm, 0, 1)
+
+    cmap = plt.get_cmap(colormap)
+    rgb_float = cmap(norm)[..., :3]  # values in [0,1]
+    rgb = (rgb_float * 255).astype(np.uint8)
+
+    outside_value_rgb = np.array(outside_value_rgb, dtype=np.uint8)
+    rgb[~mask] = outside_value_rgb
+
+    # -----------------------------
+    # 6) Save scalar NIfTI
+    # -----------------------------
+    scalar_img = sitk.GetImageFromArray(scalar_heatmap.astype(np.float32))
+    scalar_img.CopyInformation(vol_img)
+    sitk.WriteImage(scalar_img, output_scalar_path)
+
+    # -----------------------------
+    # 7) Save RGB NIfTI
+    # -----------------------------
+    rgb_img = sitk.GetImageFromArray(rgb, isVector=True)
+    rgb_img.CopyInformation(vol_img)
+    sitk.WriteImage(rgb_img, output_rgb_path)
+
+    # -----------------------------
+    # 8) Save scale metadata JSON
+    # -----------------------------
+    json_path = output_rgb_path
+    if json_path.endswith(".nii.gz"):
+        json_path = json_path[:-7] + "_scale.json"
+    else:
+        json_path = os.path.splitext(json_path)[0] + "_scale.json"
+
+    scale_info = {
+        "HU_min": hu_min,
+        "HU_max": hu_max,
+        "n_levels": int(n_levels),
+        "levels": [float(x) for x in levels.tolist()],
+        "colormap": colormap,
+        "orientation": "RAS",
+        "scalar_output": output_scalar_path,
+        "rgb_output": output_rgb_path,
+    }
+
+    with open(json_path, "w") as f:
+        json.dump(scale_info, f, indent=2)
+
+    # -----------------------------
+    # 9) Info
+    # -----------------------------
+    print("Scalar heatmap saved :", output_scalar_path)
+    print("RGB heatmap saved    :", output_rgb_path)
+    print("Scale JSON saved     :", json_path)
+
+
+"""
+AHA 17-Segment Myocardial Segmentation
+Robust AHA17 segmentation using anatomical masks.
+
+Mask mapping:
+    1: heart_myocardium
+    2: heart_atrium_left
+    3: heart_ventricle_left
+    4: heart_atrium_right
+    5: heart_ventricle_right
+    6: aorta
+    7: pulmonary_artery
+
+Method:
+  - Long axis      : PCA of the myocardium
+  - Axis direction : Aorta voxels closest to the LV (aortic valve = BASE)
+                     → consistent across patients, independent of aorta size
+  - Apex detection : The most distal 1% of myocardium voxels (small t)
+  - Base detection : 90th percentile of LV voxels along the base direction (large t)
+  - z_norm         : t_apex → 0, t_base → 1 (single reference system)
+  - RV insertion   : Intersection of RV and myocardium → angular zero reference
+  - AHA segment order: segment 1 = anterior-septal (CCW from RV insertion)
+"""
+
+# ---------------------------------------------------------------------------
+# Long axis detection
+# ---------------------------------------------------------------------------
+def compute_long_axis(
+    myocardium_mask: np.ndarray,
+    lv_mask: np.ndarray,
+    aorta_mask: np.ndarray,
+):
+    """
+    Computes the long axis vector and projection values.
+
+    Axis direction: from APEX to BASE
+      - The aortic valve region is estimated from the aorta voxels closest to the LV
+      - Independent of the absolute size of the aorta
+
+    Returns
+    -------
+    axis   : unit vector pointing from APEX to BASE
+    center : center of mass of myocardium voxels
+    pts    : myocardium voxel coordinates (N, 3)
+    t_vals : projection value for each voxel (N,)
+    """
+
+    pts    = np.argwhere(myocardium_mask).astype(np.float64)
+    center = pts.mean(axis=0)
+
+    pca = PCA(n_components=3)
+    pca.fit(pts)
+    axis = pca.components_[0]
+
+    if aorta_mask.any() and lv_mask.any():
+        # Distance map to LV
+        lv_dist = distance_transform_edt(~lv_mask)
+
+        # Distances of aorta voxels to the LV
+        aorta_idx   = np.argwhere(aorta_mask)
+        aorta_dists = lv_dist[aorta_idx[:, 0], aorta_idx[:, 1], aorta_idx[:, 2]]
+
+        # Closest 5% of aorta voxels to the LV = aortic valve region = BASE reference
+        cutoff         = np.percentile(aorta_dists, 5)
+        base_ref       = aorta_idx[aorta_dists <= cutoff].astype(np.float64).mean(axis=0)
+
+        # Align axis toward the BASE reference point (APEX → BASE)
+        if np.dot(axis, base_ref - center) < 0:
+            axis = -axis
+
+        print(f"  Axis direction: LV-nearest aorta reference (APEX→BASE)")
+        print(f"  BASE reference point (z,y,x): {base_ref.round(1)}")
+    else:
+        # Fallback: opposite direction of the LV centroid = BASE
+        lv_center = np.argwhere(lv_mask).astype(np.float64).mean(axis=0)
+        if np.dot(axis, lv_center - center) > 0:
+            axis = -axis
+        print(f"  Axis direction: LV centroid fallback")
+
+    t_vals = (pts - center) @ axis
+    return axis, center, pts, t_vals
+
+
+# ---------------------------------------------------------------------------
+# Anatomical boundary detection
+# ---------------------------------------------------------------------------
+def compute_anatomical_boundaries(
+    lv_mask: np.ndarray,
+    axis: np.ndarray,
+    center: np.ndarray,
+    myo_pts: np.ndarray,
+) -> dict:
+    """
+    Automatically computes anatomical boundaries using myocardium and LV masks.
+
+    Axis orientation: APEX → BASE
+      apex = small t  → myocardium percentile(1)
+      base = large t  → LV percentile(90)
+
+    Returns
+    -------
+    t_apex_abs      : apex projection value
+    t_base_abs      : basal plane projection value
+    lv_length_vox   : long axis length
+    apex_fraction   : apex cap fraction (~0.08)
+    apical_ring_end : end of apical ring (~0.33)
+    mid_ring_end    : end of mid ring (~0.67)
+    """
+
+    # Apex = distal 1% of myocardium voxels (small t)
+    t_myo      = (myo_pts - center) @ axis
+    t_apex_abs = np.percentile(t_myo, 1)
+
+    # Base = upper 10% of LV voxels toward base (large t)
+    lv_pts     = np.argwhere(lv_mask).astype(np.float64)
+    t_lv       = (lv_pts - center) @ axis
+    t_base_abs = np.percentile(t_lv, 90)
+
+    print(f"  t_apex (myo %1)           : {t_apex_abs:.1f}")
+    print(f"  t_base (LV %90)           : {t_base_abs:.1f}")
+
+    lv_length = t_base_abs - t_apex_abs
+    if lv_length <= 0:
+        raise ValueError(
+            f"Invalid LV length: t_apex={t_apex_abs:.2f}, t_base={t_base_abs:.2f}\n"
+            f"  Myo t: [{t_myo.min():.1f}, {t_myo.max():.1f}]\n"
+            f"  LV  t: [{t_lv.min():.1f},  {t_lv.max():.1f}]\n"
+            "  The axis direction may still be inverted."
+        )
+
+    third = 1.0 / 3.0
+    return {
+        "t_apex_abs":      t_apex_abs,
+        "t_base_abs":      t_base_abs,
+        "lv_length_vox":   lv_length,
+        "apex_fraction":   0.08,
+        "apical_ring_end": third,       # 0.33
+        "mid_ring_end":    third * 2,   # 0.67
+    }
+
+# ---------------------------------------------------------------------------
+# RV insertion point detection
+# ---------------------------------------------------------------------------
+def find_rv_insertion_point(myocardium_mask: np.ndarray, rv_mask: np.ndarray):
+    """
+    Finds the centroid of the intersection region between the RV and myocardium.
+
+    Returns
+    -------
+    [z, y, x] array or None
+    """
+    myo_dilated  = binary_dilation(myocardium_mask, iterations=3)
+    rv_dilated   = binary_dilation(rv_mask,         iterations=3)
+    intersection = myo_dilated & rv_dilated
+
+    if not intersection.any():
+        intersection = myocardium_mask & rv_mask
+    if not intersection.any():
+        return None
+
+    pts = np.argwhere(intersection).astype(np.float64)
+    return pts.mean(axis=0)
+
+
+# ---------------------------------------------------------------------------
+# AHA 17-segment
+# ---------------------------------------------------------------------------
+def aha17_segment(
+    segmentation_array: np.ndarray,
+    label_map: dict = None,
+    boundaries: dict = None,
+) -> np.ndarray:
+    """
+    Produce AHA 17 segment label map with using anatomical masks
+
+    segmentation_array : 3D numpy array (z, y, x), integer
+    boundaries         : compute_anatomical_boundaries() output,
+                         if None, will be calculate inside
+
+    out
+    --------
+    labels : 3D numpy array, dtype=int32
+             1-17 AHA segment numbers (out of myocardium = 0)
+
+    AHA 17-segment
+    ---------------------
+    Basal  (z_norm >= mid_ring_end)                → seg  1- 6  (60° x 6)
+    Mid    (apical_ring_end <= z < mid_ring_end)   → seg  7-12  (60° x 6)
+    Apical (apex_fraction   <= z < apical_ring_end)→ seg 13-16  (90° x 4)
+    Apex   (z < apex_fraction)                     → seg 17
+
+    (from RV insertion CCW):
+      Seg 1 : Anteroseptal   (  0°– 60°)
+      Seg 2 : Anterior       ( 60°–120°)
+      Seg 3 : Anterolateral  (120°–180°)
+      Seg 4 : Inferolateral  (180°–240°)
+      Seg 5 : Inferior       (240°–300°)
+      Seg 6 : Inferoseptal   (300°–360°)
+    """
+    if label_map is None:
+        label_map = {
+            1: 'heart_myocardium',
+            2: 'heart_atrium_left',
+            3: 'heart_ventricle_left',
+            4: 'heart_atrium_right',
+            5: 'heart_ventricle_right',
+            6: 'aorta',
+            7: 'pulmonary_artery',
+        }
+
+    inv_map = {v: k for k, v in label_map.items()}
+
+    myocardium_mask = (segmentation_array == inv_map['heart_myocardium'])
+    lv_mask         = (segmentation_array == inv_map['heart_ventricle_left'])
+    rv_mask         = (segmentation_array == inv_map['heart_ventricle_right'])
+    aorta_mask      = (segmentation_array == inv_map['aorta'])
+
+    if not myocardium_mask.any():
+        raise ValueError("Myocardium mask empty!")
+    if not lv_mask.any():
+        raise ValueError("LV ventricle mask empty!")
+
+    print(f"  Myocardium voxel number   : {myocardium_mask.sum():,}")
+    print(f"  LV ventricle voxel number : {lv_mask.sum():,}")
+    print(f"  RV ventricle voxel number : {rv_mask.sum():,}")
+    print(f"  Aorta voxel number        : {aorta_mask.sum():,}")
+
+    # ------------------------------------------------------------------
+    # 1) LAX, from APEX to BASE
+    # ------------------------------------------------------------------
+    axis, center, pts, t_vals = compute_long_axis(
+        myocardium_mask, lv_mask, aorta_mask
+    )
+    print(f"  Long Axis (Array Space)  : {axis.round(3)}")
+
+    # ------------------------------------------------------------------
+    # 2) Anatomical boundaries
+    # ------------------------------------------------------------------
+    if boundaries is None:
+        boundaries = compute_anatomical_boundaries(
+            lv_mask, axis, center, pts
+        )
+
+    t_apex          = boundaries["t_apex_abs"]
+    t_base          = boundaries["t_base_abs"]
+    lv_length       = boundaries["lv_length_vox"]
+    apex_fraction   = boundaries["apex_fraction"]
+    apical_ring_end = boundaries["apical_ring_end"]
+    mid_ring_end    = boundaries["mid_ring_end"]
+
+    print(f"  LV length (voksel)        : {lv_length:.1f}")
+    print(f"  apex_fraction             : {apex_fraction:.3f}")
+    print(f"  apical_ring_end           : {apical_ring_end:.3f}")
+    print(f"  mid_ring_end              : {mid_ring_end:.3f}")
+
+    # ------------------------------------------------------------------
+    # 3) z_norm: t_apex=0, t_base=1
+    # ------------------------------------------------------------------
+    z_norm = (t_vals - t_apex) / lv_length
+
+    # ------------------------------------------------------------------
+    # 4) Orthonormal basis for SAX
+    # ------------------------------------------------------------------
+    ref = np.array([0.0, 1.0, 0.0])
+    if abs(np.dot(axis, ref)) > 0.95:
+        ref = np.array([1.0, 0.0, 0.0])
+    v1 = ref - np.dot(ref, axis) * axis
+    v1 /= np.linalg.norm(v1)
+    v2 = np.cross(axis, v1)
+    v2 /= np.linalg.norm(v2)
+
+    # ------------------------------------------------------------------
+    # 5) RV insertion point (angular)
+    # ------------------------------------------------------------------
+    angle_offset = 0.0
+    if rv_mask.any():
+        rv_ins = find_rv_insertion_point(myocardium_mask, rv_mask)
+        if rv_ins is not None:
+            rel          = rv_ins - center
+            rv_angle     = np.degrees(np.arctan2(rel @ v2, rel @ v1))
+            angle_offset = (rv_angle - 60.0 + 360.0) % 360.0
+            print(f"  RV insertion angle        : {rv_angle:.1f},  offset: {angle_offset:.1f}")
+        else:
+            print("  WARNING: Can not find RV insertion, angular offset = 0")
+    else:
+        print("  WARNING: There is no RV mask, angular offset = 0")
+
+    # ------------------------------------------------------------------
+    # 6) Segment ataması
+    # ------------------------------------------------------------------
+    labels = np.zeros(myocardium_mask.shape, dtype=np.int32)
+
+    for i, p in enumerate(pts):
+        rel   = p - center
+        theta = (np.degrees(np.arctan2(rel @ v2, rel @ v1)) - angle_offset + 360.0) % 360.0
+        z     = z_norm[i]
+
+        if z < apex_fraction:
+            seg = 17                                # apex cap
+        elif z < apical_ring_end:
+            seg = 12 + int(theta // 90.0) + 1      # 13–16
+        elif z < mid_ring_end:
+            seg = 6  + int(theta // 60.0) + 1      # 7–12
+        else:
+            seg = 0  + int(theta // 60.0) + 1      # 1–6
+
+        seg = max(1, min(17, seg))
+        labels[int(p[0]), int(p[1]), int(p[2])] = seg
+
+    counts = {s: int((labels == s).sum()) for s in range(1, 18)}
+    print("\n  Segment voxel numbers:")
+    for s, c in counts.items():
+        print(f"    Seg {s:2d}: {c:6,} voxel")
+
+    empty = [s for s, c in counts.items() if c == 0]
+    if empty:
+        print(f"\n  WARNING: Empty Segments: {empty}")
+
+    diag = {
+        "axis":         axis,
+        "center":       center,
+        "v1":           v1,
+        "v2":           v2,
+        "t_apex":       t_apex,
+        "t_base":       t_base,
+        "lv_length":    lv_length,
+        "angle_offset": angle_offset,
+        "boundaries":   boundaries,
+    }
+
+    return labels, diag
+
+# ---------------------------------------------------------------------------
+# Subdivision
+# ---------------------------------------------------------------------------
+def subdivide_aha_segments(
+    labels: np.ndarray,
+    seg_array: np.ndarray,
+    diag: dict,
+    n_angular: int = 4,
+    n_longitudinal: int = 4,
+    label_map: dict = None,
+) -> np.ndarray:
+    """
+    Subdivides each AHA segment into n_angular x n_longitudinal subsegments.
+    Total: 17 x (n_angular * n_longitudinal) subsegments.
+
+    Method:
+      - Compute the true t and theta ranges for each segment
+      - Longitudinal: divide the range t_min → t_max into n_longitudinal equal parts
+      - Angular     : divide the range theta_min → theta_max into n_angular equal parts
+      - Sub ID      : (aha_seg - 1) * n_sub + l_bin * n_angular + a_bin + 1
+    """
+    if label_map is None:
+        label_map = {
+            1: "heart_myocardium",
+            2: "heart_atrium_left",
+            3: "heart_ventricle_left",
+            4: "heart_atrium_right",
+            5: "heart_ventricle_right",
+            6: "aorta",
+            7: "pulmonary_artery",
+        }
+
+    inv_map  = {v: k for k, v in label_map.items()}
+    axis     = diag["axis"]
+    center   = diag["center"]
+    v1       = diag["v1"]
+    v2       = diag["v2"]
+
+    myocardium_mask = (seg_array == inv_map["heart_myocardium"])
+
+    n_sub = n_angular * n_longitudinal
+    print(f"  {n_angular} angular x {n_longitudinal} longitudinal = {n_sub} total segment")
+
+    # Compute true ranges for each AHA segment
+    seg_info = {}
+    for s in range(1, 18):
+        seg_pts = np.argwhere(labels == s).astype(np.float64)
+        if len(seg_pts) == 0:
+            continue
+
+        # Longitudinal range
+        t_vals = (seg_pts - center) @ axis
+
+        # Angular range: compute theta for each voxel
+        rel      = seg_pts - center
+        x_vals   = rel @ v1
+        y_vals   = rel @ v2
+
+        # Centroid angle
+        theta_ctr = (np.degrees(np.arctan2(y_vals.mean(), x_vals.mean())) + 360.0) % 360.0
+
+        # Delta relative to centroid (-180, +180)
+        theta_all = (np.degrees(np.arctan2(y_vals, x_vals)) + 360.0) % 360.0
+        delta_all = (theta_all - theta_ctr + 540.0) % 360.0 - 180.0
+
+        seg_info[s] = {
+            "t_min":     t_vals.min(),
+            "t_max":     t_vals.max(),
+            "theta_ctr": theta_ctr,
+            "d_min":     delta_all.min(),   # true angular range of the segment
+            "d_max":     delta_all.max(),
+        }
+
+    sub_labels = np.zeros(labels.shape, dtype=np.int32)
+    pts        = np.argwhere(myocardium_mask).astype(np.float64)
+
+    for p in pts:
+        zi, yi, xi = int(p[0]), int(p[1]), int(p[2])
+        s = labels[zi, yi, xi]
+        if s == 0 or s not in seg_info:
+            continue
+
+        si = seg_info[s]
+
+        # Longitudinal bin within the true t range of the segment
+        t       = float((p - center) @ axis)
+        t_width = si["t_max"] - si["t_min"]
+        l_local = np.clip((t - si["t_min"]) / t_width, 0.0, 1.0 - 1e-9) if t_width > 0 else 0.0
+        l_bin   = min(int(l_local * n_longitudinal), n_longitudinal - 1)
+
+        # Angular bin within the true delta range of the segment
+        rel     = p - center
+        theta_p = (np.degrees(np.arctan2(rel @ v2, rel @ v1)) + 360.0) % 360.0
+        delta   = (theta_p - si["theta_ctr"] + 540.0) % 360.0 - 180.0
+        d_width = si["d_max"] - si["d_min"]
+        a_local = np.clip((delta - si["d_min"]) / d_width, 0.0, 1.0 - 1e-9) if d_width > 0 else 0.0
+        a_bin   = min(int(a_local * n_angular), n_angular - 1)
+
+        sub_id = (s - 1) * n_sub + l_bin * n_angular + a_bin + 1
+        sub_labels[zi, yi, xi] = sub_id
+
+    # Statistics
+    total_sub = 17 * n_sub
+    counts    = {i: int((sub_labels == i).sum()) for i in range(1, total_sub + 1)}
+    filled    = sum(1 for c in counts.values() if c > 0)
+    empty_sub = [i for i, c in counts.items() if c == 0]
+    print(f"  Filled subsegments: {filled} / {total_sub}")
+    if empty_sub:
+        print(f"  Empty subsegments : {empty_sub[:30]}{'...' if len(empty_sub) > 30 else ''}")
+
+    return sub_labels

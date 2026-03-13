@@ -2,19 +2,19 @@ from utils import *
 
 if __name__ == "__main__": 
 
-    args["data_dir"] = r"/mnt/research/research/Data/MyocardialScarDefns_kycn/Data"         # Main data directory
+    args["data_dir"] = r"/mnt/research/research/Data/MyocardialScarDefns_kycn/have_problems"         # Main data directory
     args["output_dir"] = r"/mnt/research/research/Data/MyocardialScarDefns_kycn/outs"       # output files save directory
-    args["patient_folder_name"] = []                                                 # if you want to work for some spesific folders, fill with the names, otherwise set empty
-    args["patient_folder_overwrite"] = 1                                                    # 0 means -> if the same output folder name in the output path, do not process it, pass the patient
+    args["patient_folder_name"] = ["p_040","p_087","p_111"]                                                 # if you want to work for some spesific folders, fill with the names, otherwise set empty
+    args["patient_folder_overwrite"] = 0                                                    # 0 means -> if the same output folder name in the output path, do not process it, pass the patient
     args["total_seg_model"] = "heartchambers_highres"                                       # Total segmentator model name
     args["segmentation_mask_onoff"] = 1                                                     # segmentation_mask -> open/close choosing myocardium segmentation filter for multiclass segmentation files
     args["erosion_onoff"] = 1                                                               # use/ do not use erosion
     args["erosion_disk_r_mm"] = 0.5                                                         # erosion disk radius
     args["erosion_run_n_times"] = 2                                                         # use erosion that times
-    args["clustering_type"] = 3                                                             # 1 - cylindirical in 2 axis, 2 - kmeans, 3 - use equipotential surfaces in SAX thickness and use cylindirical in 4CH, else do not use clustering
+    args["clustering_type"] = 3                                                             # 1 - cylindirical in 2 axis, 2 - kmeans, 3 - use equipotential surfaces in SAX thickness and use surface kmean and penetrate through thickness in 4CH, else do not use clustering
     args["segment_seed_number"] = 432                                                       # total number of segments used for clustering
-    args["segment_nz_number"] = 144                                                         # n_z -> number of slices in z direction for clustering = 1, total number of slices in 4CH cylindirical direction for clustering = 3
-    args["k_means_3d"] = 1                                                                  # k_means_3d -> 1 - use 3D kmeans algorithm, 0 - use 2D
+    args["segment_nz_number"] = 144                                                         # n_z -> number of slices in z direction for clustering = 1, total number of surface slices in 4CH for clustering = 3
+    args["k_means_3d"] = 1                                                                  # when clustering = 2; k_means_3d -> 1 - use 3D kmeans algorithm, 0 - use 2D
     args["laplace_max_iter"] = 5000                                                         # laplace solver max iteration
     args["laplace_tolerance"] = 1e-5                                                        # laplace solver tolerance
 
